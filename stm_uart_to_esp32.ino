@@ -1,30 +1,25 @@
 #include <Arduino.h>
 #include <string.h>
 #include <stdlib.h>
+#include <HardwareSerial.h>
+
+// ---- FORCE CREATE Serial2 if core doesn't provide it ----
+HardwareSerial Serial2(USART2);
 
 // ================= CONFIG =================
-#define WEBSERVER 1   // ENABLE WEB SERVER (NOW UART, NOT I2C)
-#define USB_DEBUG 1
+#define WEBSERVER 1
+#define USB_DEBUG 0
 #define LINE_SENSOR_MODE 1
 
-// --- Line Analysis Algorithm Selection ---
 #define ALGO_MOST_CENTERED 1
-#define ALGO_LARGEST       2
-#define ALGO_NORMAL        3
 #define LINE_ANALYSIS_ALGORITHM ALGO_MOST_CENTERED
 
-// ======================================================
-// CHANGED PART 1: I2C → UART (WEB SERVER ONLY)
-// ======================================================
 #if WEBSERVER
 #define ESP_UART_BAUD 115200
 char command_buffer[32];
 uint8_t cmdIndex = 0;
-
-// Explicit UART on PB6 / PB7 (USART2)
-HardwareSerial ESPSerial(PB7, PB6); // RX, TX
+#define ESPSerial Serial2   // ✅ USART2 (PA2 / PA3)
 #endif
-// ======================================================
 
 // --- Pin Definitions ---
 #define MOTOR_A_PWM PA1
@@ -41,7 +36,7 @@ HardwareSerial ESPSerial(PB7, PB6); // RX, TX
 const int SENSOR_BAUD_RATE = 230400;
 const int DEBUG_BAUD_RATE  = 115200;
 
-// --- PID and Motor Control Variables ---
+// --- PID ---
 float Kp = 5.150;
 float Kd = 4.550;
 int SLOW_SPEED = 130;
@@ -55,7 +50,7 @@ int lastError = 0;
 int error = 0;
 unsigned long previousTime = 0;
 
-// --- State variables for line tracking and memory ---
+// --- Line memory ---
 const int LAST_END_LEFT = 0;
 const int LAST_END_RIGHT = 1;
 const int LAST_END_UNKNOWN = 2;
@@ -64,19 +59,13 @@ int last_end = LAST_END_UNKNOWN;
 unsigned long last_end_update_time = 0;
 unsigned int LAST_END_TIMEOUT_MS = 110;
 
-// --- Grace period for handling dashed lines ---
 unsigned long line_lost_time = 0;
 unsigned int DASHED_LINE_GRACE_PERIOD_MS = 180;
 
-// --- Turn Speeds for Line Lost ---
 int LINE_LOST_TURN_SPEED = 150;
 int LINE_LOST_PIVOT_SPEED = -150;
 
-enum LineFeature {
-  NORMAL_LINE,
-  JUNCTION,
-  LINE_LOST
-};
+enum LineFeature { NORMAL_LINE, JUNCTION, LINE_LOST };
 
 struct LineAnalysisResult {
   int position;
@@ -84,29 +73,23 @@ struct LineAnalysisResult {
   bool isComplex;
 };
 
-// --- Function Prototypes (UNCHANGED) ---
-void stopmotors();
-void pidTurn(int error, bool isComplex);
+// ---- Function prototypes (UNCHANGED) ----
 void motorspeed(int rightmotorspeed, int leftmotorspeed);
+void pidTurn(int error, bool isComplex);
 void handleLineLost();
-LineAnalysisResult analyzeSensorData(uint8_t rawSensorByte);
 void processCommand(char* command);
+LineAnalysisResult analyzeSensorData(uint8_t raw);
 
 // ================= SETUP =================
 void setup() {
   Serial.begin(DEBUG_BAUD_RATE);
   delay(1500);
-  Serial.println("Initializing USB Debug Serial...");
 
 #if WEBSERVER
-  //  CHANGED PART 2: UART init instead of Wire.begin()
-  ESPSerial.begin(ESP_UART_BAUD);
-  Serial.println("UART Webserver enabled on PB6/PB7");
+  ESPSerial.begin(ESP_UART_BAUD);   // ✅ UART instead of I2C
 #endif
 
-  // LSA08 stays on Serial1 (PA9 / PA10)
-  Serial1.begin(SENSOR_BAUD_RATE);
-  Serial.println("Initializing Hardware Serial1 for Line Sensor...");
+  Serial1.begin(SENSOR_BAUD_RATE);  // LSA08
 
   pinMode(MOTOR_A_PWM, OUTPUT);
   pinMode(MOTOR_A_IN1, OUTPUT);
@@ -114,19 +97,18 @@ void setup() {
   pinMode(MOTOR_B_PWM, OUTPUT);
   pinMode(MOTOR_B_IN1, OUTPUT);
   pinMode(MOTOR_B_IN2, OUTPUT);
+
   pinMode(STBY_PIN, OUTPUT);
   digitalWrite(STBY_PIN, HIGH);
+
   pinMode(UEN_PIN, OUTPUT);
   digitalWrite(UEN_PIN, LOW);
-  pinMode(JUNCTION_PULSE, INPUT);
 
-  Serial.println("Setup Complete.");
+  pinMode(JUNCTION_PULSE, INPUT);
   previousTime = micros();
 }
 
-// ================= analyzeSensorData() =================
-// 
-// ======================================================
+// ================= analyzeSensorData =================
 LineAnalysisResult analyzeSensorData(uint8_t rawSensorByte) {
     LineAnalysisResult result;
     result.position = 255;
@@ -143,8 +125,6 @@ LineAnalysisResult analyzeSensorData(uint8_t rawSensorByte) {
     }
 
     int weights[8] = {0,10,20,30,40,50,60,70};
-
-#if LINE_ANALYSIS_ALGORITHM == ALGO_MOST_CENTERED
     uint8_t sensors[8];
     for (int i = 0; i < 8; i++) sensors[i] = (rawSensorByte >> i) & 1;
 
@@ -186,9 +166,8 @@ LineAnalysisResult analyzeSensorData(uint8_t rawSensorByte) {
         sum += weights[i];
         cnt++;
     }
-    result.position = sum / cnt;
-#endif
 
+    result.position = sum / cnt;
     result.featureType = NORMAL_LINE;
     return result;
 }
@@ -197,7 +176,6 @@ LineAnalysisResult analyzeSensorData(uint8_t rawSensorByte) {
 void loop() {
 
 #if WEBSERVER
-  // CHANGED PART 3: UART receive instead of I2C ISR
   while (ESPSerial.available()) {
     char c = ESPSerial.read();
     if (c == '\n' || c == '\r') {
@@ -210,18 +188,36 @@ void loop() {
   }
 #endif
 
-  if (Serial1.available()) {
-    uint8_t rawSensorByte = Serial1.read();
-    LineAnalysisResult lineState = analyzeSensorData(rawSensorByte);
+  if (last_end != LAST_END_UNKNOWN &&
+      millis() - last_end_update_time > LAST_END_TIMEOUT_MS) {
+    last_end = LAST_END_UNKNOWN;
+  }
 
-    switch (lineState.featureType) {
-      case NORMAL_LINE:
-        error = lineState.position - setPoint;
-        pidTurn(error, lineState.isComplex);
+  if (Serial1.available()) {
+    uint8_t raw = Serial1.read();
+    LineAnalysisResult line = analyzeSensorData(raw);
+
+    switch (line.featureType) {
+      case NORMAL_LINE: {
+        line_lost_time = 0;
+
+        if (raw & 0x01) {
+          last_end = LAST_END_LEFT;
+          last_end_update_time = millis();
+        } else if (raw & 0x80) {
+          last_end = LAST_END_RIGHT;
+          last_end_update_time = millis();
+        }
+
+        error = line.position - setPoint;
+        pidTurn(error, line.isComplex);
         break;
+      }
+
       case JUNCTION:
         motorspeed(junctionSpeed, junctionSpeed);
         break;
+
       case LINE_LOST:
         handleLineLost();
         break;
@@ -229,37 +225,28 @@ void loop() {
   }
 }
 
-// ================= processCommand() =================
+// ================= UART COMMAND =================
 void processCommand(char* command) {
     char* separator = strchr(command, ':');
-    if (separator != NULL) {
-        *separator = '\0';
-        char* valueStr = separator + 1;
+    if (!separator) return;
+    *separator = '\0';
+    char* valueStr = separator + 1;
 
-#if USB_DEBUG
-        Serial.print("UART CMD RX: '");
-        Serial.print(command);
-        Serial.print("' VAL: '");
-        Serial.print(valueStr);
-        Serial.println("'");
-#endif
-
-        if (strcmp(command, "KP") == 0) Kp = atof(valueStr);
-        else if (strcmp(command, "KD") == 0) Kd = atof(valueStr);
-        else if (strcmp(command, "BS") == 0) baseSpeed = atoi(valueStr);
-        else if (strcmp(command, "MS") == 0) maxSpeed = atoi(valueStr);
-        else if (strcmp(command, "MN") == 0) minSpeed = atoi(valueStr);
-        else if (strcmp(command, "SS") == 0) SLOW_SPEED = atoi(valueStr);
-        else if (strcmp(command, "SP") == 0) setPoint = atoi(valueStr);
-        else if (strcmp(command, "LT") == 0) LAST_END_TIMEOUT_MS = atoi(valueStr);
-        else if (strcmp(command, "DG") == 0) DASHED_LINE_GRACE_PERIOD_MS = atoi(valueStr);
-        else if (strcmp(command, "TS") == 0) LINE_LOST_TURN_SPEED = atoi(valueStr);
-        else if (strcmp(command, "PS") == 0) LINE_LOST_PIVOT_SPEED = atoi(valueStr);
-        else if (strcmp(command, "JS") == 0) junctionSpeed = atoi(valueStr);
-    }
+    if      (!strcmp(command,"KP")) Kp = atof(valueStr);
+    else if (!strcmp(command,"KD")) Kd = atof(valueStr);
+    else if (!strcmp(command,"BS")) baseSpeed = atoi(valueStr);
+    else if (!strcmp(command,"MS")) maxSpeed = atoi(valueStr);
+    else if (!strcmp(command,"MN")) minSpeed = atoi(valueStr);
+    else if (!strcmp(command,"SS")) SLOW_SPEED = atoi(valueStr);
+    else if (!strcmp(command,"SP")) setPoint = atoi(valueStr);
+    else if (!strcmp(command,"LT")) LAST_END_TIMEOUT_MS = atoi(valueStr);
+    else if (!strcmp(command,"DG")) DASHED_LINE_GRACE_PERIOD_MS = atoi(valueStr);
+    else if (!strcmp(command,"TS")) LINE_LOST_TURN_SPEED = atoi(valueStr);
+    else if (!strcmp(command,"PS")) LINE_LOST_PIVOT_SPEED = atoi(valueStr);
+    else if (!strcmp(command,"JS")) junctionSpeed = atoi(valueStr);
 }
 
-
+// ================= MOTOR FUNCTIONS (UNCHANGED) =================
 void handleLineLost() {
     if (last_end == LAST_END_RIGHT) {
         motorspeed(LINE_LOST_PIVOT_SPEED, LINE_LOST_TURN_SPEED);
@@ -279,8 +266,7 @@ void pidTurn(int error, bool isComplex) {
     int motorSpeed = round((Kp * error) + (Kd * derivative));
     lastError = error;
 
-    int dynamicBaseSpeed = baseSpeed;
-    if (isComplex) dynamicBaseSpeed = SLOW_SPEED + 1;
+    int dynamicBaseSpeed = isComplex ? SLOW_SPEED + 1 : baseSpeed;
 
     int currentSpeed = map(abs(error), 0, setPoint / 1.7,
                            dynamicBaseSpeed, SLOW_SPEED);
@@ -292,14 +278,6 @@ void pidTurn(int error, bool isComplex) {
     motorspeed(rightMotorSpeed, leftMotorSpeed);
 }
 
-void stopmotors() {
-    digitalWrite(MOTOR_A_IN1, LOW);
-    digitalWrite(MOTOR_A_IN2, LOW);
-    digitalWrite(MOTOR_B_IN1, LOW);
-    digitalWrite(MOTOR_B_IN2, LOW);
-    analogWrite(MOTOR_A_PWM, 0);
-    analogWrite(MOTOR_B_PWM, 0);
-}
 
 void motorspeed(int rightmotorspeed, int leftmotorspeed) {
     if (rightmotorspeed > 0) {
