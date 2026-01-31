@@ -1,0 +1,54 @@
+#define MOTOR_A_PWM PA1
+#define MOTOR_A_IN1 PB9
+#define MOTOR_A_IN2 PB8
+#define MOTOR_B_PWM PA6
+#define MOTOR_B_IN1 PA5
+#define MOTOR_B_IN2 PA4
+#define UEN_PIN PA15
+#define STBY_PIN PB12
+#define JUNCTION_PULSE PB4
+
+// --- Serial Baud Rates ---
+const int SENSOR_BAUD_RATE = 230400;
+const int DEBUG_BAUD_RATE = 115200;
+
+
+
+void setup() {
+  // put your setup code here, to run once:
+   Serial.begin(DEBUG_BAUD_RATE);
+    delay(1500);
+    Serial.println("Initializing USB Debug Serial...");
+
+
+    Serial1.begin(SENSOR_BAUD_RATE);
+
+    pinMode(MOTOR_A_PWM, OUTPUT);
+    pinMode(MOTOR_A_IN1, OUTPUT);
+    pinMode(MOTOR_A_IN2, OUTPUT);
+    pinMode(MOTOR_B_PWM, OUTPUT);
+    pinMode(MOTOR_B_IN1, OUTPUT);
+    pinMode(MOTOR_B_IN2, OUTPUT);
+    pinMode(STBY_PIN, OUTPUT);
+    digitalWrite(STBY_PIN, HIGH);
+    pinMode(UEN_PIN, OUTPUT);
+    digitalWrite(UEN_PIN, LOW);
+    pinMode(JUNCTION_PULSE, INPUT);
+
+
+}
+
+void loop() {
+  if (Serial1.available() > 0) {
+    uint8_t rawSensorByte = Serial1.read();
+    uint8_t sensors[8];
+
+    for (int i = 0; i < 8; i++) {
+      sensors[i] = (rawSensorByte >> i) & 0x01;
+      Serial.print(sensors[i]);
+      Serial.print(" ");
+    }
+
+    Serial.println(); 
+  }
+}
